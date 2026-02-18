@@ -1,15 +1,18 @@
-# VERSION: FINAL-FIX-COMPLETE
+# VERSION: FINAL-FULL-FIX-V2
 import os
 import json
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import matplotlib.pyplot as plt
 import jinja2
 
-# 日本語フォント設定
-plt.rcParams['font.family'] = 'Noto Sans CJK JP' 
+# 日本語フォント設定（環境に合わせて回避設定も追加）
+try:
+    plt.rcParams['font.family'] = 'Noto Sans CJK JP'
+except:
+    pass
 
 def get_service_client():
     sa_json_str = os.environ.get("GOOGLE_SA_JSON")
@@ -26,11 +29,11 @@ def get_service_client():
 
 def fetch_gsc_data(service, site_url, start_date, end_date):
     """
-    GSCからデータを取得し、必ず正しいカラムを持つDataFrameを返す関数
+    データ取得関数：データが0件でも必ずカラム付きの空DFを返す安全仕様
     """
     print(f"DEBUG: Fetching data for {site_url} ({start_date} ~ {end_date})...")
     
-    # dimensionsに 'date' を指定
+    # 必須: dimensionsにdateを入れる
     request = {
         'startDate': start_date, 
         'endDate': end_date, 
@@ -38,7 +41,7 @@ def fetch_gsc_data(service, site_url, start_date, end_date):
         'rowLimit': 25000
     }
     
-    # 空のときに返す基本の形（これがないとKeyErrorになります）
+    # 空の場合のデフォルト値（これがないとKeyErrorになる）
     empty_df = pd.DataFrame(columns=['date', 'clicks', 'impressions', 'ctr', 'position'])
     
     try:
@@ -46,24 +49,23 @@ def fetch_gsc_data(service, site_url, start_date, end_date):
         rows = response.get('rows', [])
         
         if not rows:
-            print("DEBUG: 取得データが0件です。空のテーブルを返します。")
+            print(f"DEBUG: {start_date} の期間はデータが0件です。")
             return empty_df
         
         df = pd.DataFrame(rows)
         
-        # 'keys' カラムが存在するかチェック
-        if 'keys' not in df.columns:
+        # 'keys' カラム処理（API仕様対応）
+        if 'keys' in df.columns:
+            df['date'] = df['keys'].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else x)
+        
+        # ここで日付型変換とカラム整理
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            # 必要なカラムだけ返す
+            cols = [c for c in ['date', 'clicks', 'impressions', 'ctr', 'position'] if c in df.columns]
+            return df[cols]
+        else:
             return empty_df
-
-        # APIの仕様上 keys はリスト(['2024-01-01'])なので、中身を取り出す
-        df['date'] = df['keys'].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else x)
-        
-        # 日付型に変換
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # 不要な keys 列を削除して整理
-        output_df = df[['date', 'clicks', 'impressions', 'ctr', 'position']].copy()
-        return output_df
 
     except Exception as e:
         print(f"DEBUG: API Error: {e}")
@@ -71,14 +73,20 @@ def fetch_gsc_data(service, site_url, start_date, end_date):
 
 def create_chart(df):
     """
-    グラフ作成関数（データが空の場合はスキップするガード付き）
+    グラフ作成関数：ここがエラーの発生源でした。
+    データが空の場合は即座に終了するガードを追加しています。
     """
-    if df.empty:
-        print("WARNING: グラフ作成用データが空のため、作成をスキップします。")
+    # 【最重要ガード】データが空、またはdate列がない場合は何もしない
+    if df is None or df.empty or 'date' not in df.columns:
+        print("WARNING: グラフ作成用データが空のため、グラフ作成をスキップします。")
         return
 
     print("DEBUG: グラフ作成を開始します...")
     try:
+        # 日付変換（念のため再確認）
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        
         plt.figure(figsize=(10, 5))
         plt.plot(df['date'], df['clicks'], label='Clicks', marker='o')
         plt.title('Weekly Clicks')
@@ -87,7 +95,7 @@ def create_chart(df):
         plt.grid(True)
         plt.legend()
         
-        # 保存ディレクトリ作成
+        # 保存
         os.makedirs('reports', exist_ok=True)
         plt.savefig('reports/weekly_chart.png')
         plt.close()
@@ -96,38 +104,63 @@ def create_chart(df):
         print(f"ERROR: グラフ作成中にエラーが発生しました: {e}")
 
 def main():
-    print("--- STARTING WEEKLY REPORT (SAFE MODE) ---")
+    print("--- STARTING WEEKLY REPORT (FULL FIX) ---")
     site_url = os.environ.get("GSC_SITE_URL")
     service = get_service_client()
     
     if not service:
         return
 
-    # 環境変数から日付取得
+    # 今週（環境変数）
     start = os.environ.get("START_DATE")
     end = os.environ.get("END_DATE")
     
+    # 先週（自動計算）
+    try:
+        start_dt = datetime.strptime(start, '%Y-%m-%d')
+        end_dt = datetime.strptime(end, '%Y-%m-%d')
+        prev_start = (start_dt - timedelta(days=7)).strftime('%Y-%m-%d')
+        prev_end = (end_dt - timedelta(days=7)).strftime('%Y-%m-%d')
+    except:
+        # 日付が入っていない場合のダミー
+        prev_start, prev_end = "2000-01-01", "2000-01-01"
+
     # 1. データ取得
-    df = fetch_gsc_data(service, site_url, start, end)
+    df_current = fetch_gsc_data(service, site_url, start, end)
+    df_prev = fetch_gsc_data(service, site_url, prev_start, prev_end)
     
-    # 2. データチェック
-    if df.empty:
-        print("RESULT: データが存在しませんでした。レポートは空になります。")
-        # 空レポートの作成処理
-        os.makedirs('reports', exist_ok=True)
+    # 2. メトリクス計算用辞書（元のコードの構造に合わせる）
+    metrics = {
+        'df_current': df_current,
+        'df_prev': df_prev
+    }
+
+    # 3. レポート分岐
+    os.makedirs('reports', exist_ok=True)
+    
+    # データが空の場合のハンドリング
+    if df_current.empty:
+        print("RESULT: データが取得できませんでした（集計待ちの可能性があります）。")
         with open('reports/index.html', 'w', encoding='utf-8') as f:
-            f.write("<html><body><h1>No Data Available</h1><p>指定期間のデータはありませんでした。</p></body></html>")
+            f.write("<html><body><h1>No Data Available</h1><p>GSC data not ready yet.</p></body></html>")
     else:
-        print(f"SUCCESS: {len(df)} 件のデータを取得しました。")
+        print(f"SUCCESS: データ取得成功 ({len(df_current)} records)")
+        # グラフ作成（ガード付き関数を呼び出し）
+        create_chart(df_current)
         
-        # 3. グラフ作成（ここでエラーが起きないよう関数側でガード済み）
-        create_chart(df)
-        
-        # 4. レポート作成（簡易版）
-        os.makedirs('reports', exist_ok=True)
+        # レポート出力
+        total_clicks = df_current['clicks'].sum()
         with open('reports/index.html', 'w', encoding='utf-8') as f:
-            total_clicks = df['clicks'].sum()
-            f.write(f"<html><body><h1>Weekly Report</h1><p>Total Clicks: {total_clicks}</p><img src='weekly_chart.png'></body></html>")
+            html = f"""
+            <html>
+            <body>
+                <h1>Weekly Report ({start} ~ {end})</h1>
+                <p>Total Clicks: {total_clicks}</p>
+                <img src='weekly_chart.png' style='max-width:100%;'>
+            </body>
+            </html>
+            """
+            f.write(html)
         print("SUCCESS: レポート生成完了")
 
 if __name__ == "__main__":
